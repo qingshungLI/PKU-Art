@@ -243,9 +243,425 @@ function removeCourseSerialNumbers() {
     }
 }
 
+const HLS_TEMP_FILE_PREFIX = 'pku-art-hls-';
+
+function parseHlsAttributes(line) {
+    const attributes = {};
+    const content = line.slice(line.indexOf(':') + 1);
+    const pattern = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
+    let match;
+    while ((match = pattern.exec(content))) {
+        const value = match[2];
+        attributes[match[1]] = value.startsWith('"') ? value.slice(1, -1) : value;
+    }
+    return attributes;
+}
+
+function parseHlsIv(value) {
+    const normalized = value.replace(/^0x/i, '').padStart(32, '0');
+    if (!/^[0-9a-f]{32}$/i.test(normalized)) {
+        throw new Error(`不支持的 HLS IV：${value}`);
+    }
+    return new Uint8Array(normalized.match(/.{2}/g).map((byte) => Number.parseInt(byte, 16)));
+}
+
+function createHlsSequenceIv(sequence) {
+    const iv = new Uint8Array(16);
+    let value = BigInt(sequence);
+    for (let index = iv.length - 1; index >= 0; index -= 1) {
+        iv[index] = Number(value & 0xffn);
+        value >>= 8n;
+    }
+    return iv;
+}
+
+function waitWithAbort(delay, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(signal.reason || new DOMException('下载已取消', 'AbortError'));
+            return;
+        }
+
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(signal.reason || new DOMException('下载已取消', 'AbortError'));
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, delay);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+async function fetchHlsResource(url, signal, responseType = 'arrayBuffer', options = {}) {
+    const {
+        maxAttempts = 8,
+        omitCredentialsAfterFailure = false,
+        maxRetryDelay = 30_000,
+        requestTimeout = 45_000,
+        onRetry = null,
+    } = options;
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        if (signal?.aborted) {
+            throw signal.reason || new DOMException('下载已取消', 'AbortError');
+        }
+        const attemptController = new AbortController();
+        const forwardAbort = () => attemptController.abort(signal.reason);
+        signal?.addEventListener('abort', forwardAbort, { once: true });
+        const timeout = setTimeout(
+            () => attemptController.abort(new DOMException('HLS 请求超时', 'TimeoutError')),
+            requestTimeout,
+        );
+        try {
+            // 播放列表和分片本身不需要登录态。首次请求仍复用快速的粘滞节点；
+            // 一旦失败，后续请求不携带 HttpOnly INGRESSCOOKIE，避免一直命中故障节点。
+            const credentials = omitCredentialsAfterFailure && attempt > 1 ? 'omit' : 'include';
+            const response = await fetch(url, {
+                credentials,
+                signal: attemptController.signal,
+            });
+            if (!response.ok) {
+                const error = new Error(`HTTP ${response.status} ${response.statusText}`);
+                error.httpStatus = response.status;
+                throw error;
+            }
+            return responseType === 'text' ? await response.text() : await response.arrayBuffer();
+        } catch (error) {
+            if (error.name === 'AbortError' || signal?.aborted) {
+                throw error;
+            }
+            lastError = error;
+            // 持续出现这些状态时，等待不会使资源恢复，避免无限循环。
+            if ([400, 401, 403, 404].includes(error.httpStatus) && attempt >= 3) {
+                break;
+            }
+            if (attempt < maxAttempts) {
+                // 限流时给网关充足的恢复窗口，抖动可避免多个分片同时重试。
+                const retryDelay =
+                    Math.min(1000 * 2 ** Math.min(attempt - 1, 6), maxRetryDelay) +
+                    Math.floor(Math.random() * 1000);
+                onRetry?.({ attempt, retryDelay, error });
+                await waitWithAbort(retryDelay, signal);
+            }
+        } finally {
+            clearTimeout(timeout);
+            signal?.removeEventListener('abort', forwardAbort);
+        }
+    }
+    throw new Error(`获取 HLS 资源失败：${url}\n${lastError?.message || lastError}`);
+}
+
+async function resolveHlsMediaPlaylist(playlistUrl, signal, depth = 0) {
+    if (depth > 3) {
+        throw new Error('HLS 播放列表嵌套过深');
+    }
+
+    const text = await fetchHlsResource(playlistUrl, signal, 'text', {
+        omitCredentialsAfterFailure: true,
+    });
+    const lines = text
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    const variants = [];
+    for (let index = 0; index < lines.length; index += 1) {
+        if (!lines[index].startsWith('#EXT-X-STREAM-INF:')) continue;
+        const attributes = parseHlsAttributes(lines[index]);
+        const variantPath = lines.slice(index + 1).find((line) => !line.startsWith('#'));
+        if (variantPath) {
+            variants.push({
+                bandwidth: Number(attributes.BANDWIDTH || 0),
+                url: new URL(variantPath, playlistUrl).href,
+            });
+        }
+    }
+
+    if (variants.length > 0) {
+        variants.sort((left, right) => right.bandwidth - left.bandwidth);
+        return resolveHlsMediaPlaylist(variants[0].url, signal, depth + 1);
+    }
+
+    let mediaSequence = 0;
+    let currentKey = null;
+    let pendingDuration = 0;
+    const segments = [];
+
+    for (const line of lines) {
+        if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+            mediaSequence = Number.parseInt(line.split(':')[1], 10) || 0;
+        } else if (line.startsWith('#EXT-X-KEY:')) {
+            const attributes = parseHlsAttributes(line);
+            if (attributes.METHOD === 'NONE') {
+                currentKey = null;
+            } else if (attributes.METHOD === 'AES-128' && attributes.URI) {
+                currentKey = {
+                    method: attributes.METHOD,
+                    url: new URL(attributes.URI, playlistUrl).href,
+                    iv: attributes.IV ? parseHlsIv(attributes.IV) : null,
+                };
+            } else {
+                throw new Error(`不支持的 HLS 加密方式：${attributes.METHOD || '未知'}`);
+            }
+        } else if (line.startsWith('#EXTINF:')) {
+            pendingDuration = Number.parseFloat(line.slice('#EXTINF:'.length)) || 0;
+        } else if (line.startsWith('#EXT-X-BYTERANGE:') || line.startsWith('#EXT-X-MAP:')) {
+            throw new Error('暂不支持 Byte Range 或 fMP4 格式的 HLS 录播');
+        } else if (!line.startsWith('#')) {
+            segments.push({
+                url: new URL(line, playlistUrl).href,
+                sequence: mediaSequence + segments.length,
+                duration: pendingDuration,
+                key: currentKey ? { ...currentKey } : null,
+            });
+            pendingDuration = 0;
+        }
+    }
+
+    if (segments.length === 0) {
+        throw new Error('HLS 播放列表中没有视频分片');
+    }
+
+    return { playlistUrl, segments };
+}
+
+function sanitizeFileName(fileName) {
+    return fileName.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
+}
+
+async function cleanStaleHlsFiles(root) {
+    try {
+        const staleBefore = Date.now() - 24 * 60 * 60 * 1000;
+        for await (const [name, handle] of root.entries()) {
+            if (!name.startsWith(HLS_TEMP_FILE_PREFIX) || handle.kind !== 'file') continue;
+            const file = await handle.getFile();
+            if (file.lastModified < staleBefore) {
+                await root.removeEntry(name);
+            }
+        }
+    } catch (error) {
+        console.warn('[PKU Art] 清理 HLS 临时文件失败', error);
+    }
+}
+
+async function createHlsOutput(fileName) {
+    if (window.top === window.self && typeof window.showSaveFilePicker === 'function') {
+        const fileHandle = await window.showSaveFilePicker({
+            suggestedName: fileName,
+            types: [
+                {
+                    description: 'MPEG-TS 视频',
+                    accept: { 'video/mp2t': ['.ts'] },
+                },
+            ],
+        });
+        const writable = await fileHandle.createWritable();
+        return {
+            type: 'file-picker',
+            write: (chunk) => writable.write(chunk),
+            close: () => writable.close(),
+            abort: () => writable.abort(),
+        };
+    }
+
+    if (!navigator.storage?.getDirectory) {
+        throw new Error('当前浏览器不支持大文件流式写入，请使用最新版 Chrome/Edge/Safari');
+    }
+
+    const root = await navigator.storage.getDirectory();
+    void cleanStaleHlsFiles(root);
+    const tempName = `${HLS_TEMP_FILE_PREFIX}${Date.now()}-${crypto.randomUUID?.() || Math.random()}.ts`;
+    const fileHandle = await root.getFileHandle(tempName, { create: true });
+    const writable = await fileHandle.createWritable();
+    let isClosed = false;
+
+    return {
+        type: 'browser-download',
+        async write(chunk) {
+            await writable.write(chunk);
+        },
+        async close() {
+            await writable.close();
+            isClosed = true;
+            const file = await fileHandle.getFile();
+            const objectUrl = URL.createObjectURL(file);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download = fileName;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+
+            // 等浏览器下载管理器打开文件后再清理 OPFS 中的临时副本。
+            setTimeout(async () => {
+                URL.revokeObjectURL(objectUrl);
+                try {
+                    await root.removeEntry(tempName);
+                } catch (error) {
+                    console.warn('[PKU Art] 清理 HLS 临时文件失败', error);
+                }
+            }, 5 * 60 * 1000);
+        },
+        async abort() {
+            if (!isClosed) {
+                await writable.abort().catch(() => {});
+            }
+            await root.removeEntry(tempName).catch(() => {});
+        },
+    };
+}
+
+async function downloadHlsVideo({ playlistUrl, fileName, signal, onProgress }) {
+    const output = await createHlsOutput(fileName);
+    let outputClosed = false;
+    const requestController = new AbortController();
+    const forwardAbort = () => requestController.abort(signal.reason);
+    if (signal.aborted) {
+        forwardAbort();
+    } else {
+        signal.addEventListener('abort', forwardAbort, { once: true });
+    }
+    const requestSignal = requestController.signal;
+
+    try {
+        onProgress({ stage: '正在读取视频信息…' });
+        const { segments } = await resolveHlsMediaPlaylist(playlistUrl, requestSignal);
+        const keyPromises = new Map();
+        let downloadedBytes = 0;
+        let completedSegments = 0;
+        const startedAt = Date.now();
+        const concurrency = 8;
+        const prefetchWindow = concurrency * 3;
+
+        const reportProgress = (stage, status = 'active') => {
+            const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.1);
+            const speed = downloadedBytes / elapsedSeconds;
+            const remainingSeconds =
+                speed && completedSegments > 0
+                    ? Math.round(((segments.length - completedSegments) / completedSegments) * elapsedSeconds)
+                    : null;
+            onProgress({
+                stage,
+                completedSegments,
+                totalSegments: segments.length,
+                downloadedBytes,
+                bytesPerSecond: speed,
+                remainingSeconds,
+                status,
+            });
+        };
+
+        const getCryptoKey = (keyUrl) => {
+            if (!keyPromises.has(keyUrl)) {
+                keyPromises.set(
+                    keyUrl,
+                    fetchHlsResource(keyUrl, requestSignal).then((rawKey) => {
+                        if (rawKey.byteLength !== 16) {
+                            throw new Error(`HLS 密钥长度异常：${rawKey.byteLength} 字节`);
+                        }
+                        return crypto.subtle.importKey('raw', rawKey, { name: 'AES-CBC' }, false, ['decrypt']);
+                    }),
+                );
+            }
+            return keyPromises.get(keyUrl);
+        };
+
+        const downloadSegment = async (segment, index) => {
+            const encrypted = await fetchHlsResource(segment.url, requestSignal, 'arrayBuffer', {
+                maxAttempts: Number.POSITIVE_INFINITY,
+                omitCredentialsAfterFailure: true,
+                requestTimeout: 30_000,
+                onRetry({ attempt, retryDelay }) {
+                    reportProgress(
+                        `分片 ${index + 1} 响应较慢，${Math.ceil(retryDelay / 1000)} 秒后切换节点（第 ${attempt} 次重试）…`,
+                        'warning',
+                    );
+                },
+            });
+            if (!segment.key) {
+                return encrypted;
+            }
+            const key = await getCryptoKey(segment.key.url);
+            const iv = segment.key.iv || createHlsSequenceIv(segment.sequence);
+            return crypto.subtle.decrypt({ name: 'AES-CBC', iv }, key, encrypted);
+        };
+
+        // 8 路并发 + 24 个分片的有界预取窗口：慢分片不会立即让其他连接空闲，
+        // 同时不会像一次性拉取全部分片那样无界占用内存。
+        const waitingTasks = [];
+        let activeTasks = 0;
+        const pumpTasks = () => {
+            while (activeTasks < concurrency && waitingTasks.length > 0) {
+                const task = waitingTasks.shift();
+                activeTasks += 1;
+                Promise.resolve()
+                    .then(task.run)
+                    .then(
+                        (chunk) => task.resolve({ chunk }),
+                        (error) => task.resolve({ error }),
+                    )
+                    .finally(() => {
+                        activeTasks -= 1;
+                        pumpTasks();
+                    });
+            }
+        };
+        const scheduleSegment = (segment, index) =>
+            new Promise((resolve) => {
+                waitingTasks.push({ run: () => downloadSegment(segment, index), resolve });
+                pumpTasks();
+            });
+
+        const segmentDownloads = new Array(segments.length);
+        const initialWindowSize = Math.min(prefetchWindow, segments.length);
+        for (let index = 0; index < initialWindowSize; index += 1) {
+            segmentDownloads[index] = scheduleSegment(segments[index], index);
+        }
+
+        for (let index = 0; index < segments.length; index += 1) {
+            if (signal.aborted) {
+                throw new DOMException('下载已取消', 'AbortError');
+            }
+
+            const result = await segmentDownloads[index];
+            if (result.error) {
+                throw result.error;
+            }
+            const { chunk } = result;
+            const nextIndex = index + prefetchWindow;
+            if (nextIndex < segments.length) {
+                segmentDownloads[nextIndex] = scheduleSegment(segments[nextIndex], nextIndex);
+            }
+            segmentDownloads[index] = null;
+
+            await output.write(chunk);
+            downloadedBytes += chunk.byteLength;
+            completedSegments += 1;
+
+            reportProgress('正在下载视频分片…');
+        }
+
+        onProgress({ stage: '正在保存 TS 文件…' });
+        await output.close();
+        outputClosed = true;
+        return { outputType: output.type, downloadedBytes, segmentCount: segments.length };
+    } catch (error) {
+        requestController.abort(error);
+        if (!outputClosed) {
+            await output.abort().catch(() => {});
+        }
+        throw error;
+    } finally {
+        signal.removeEventListener('abort', forwardAbort);
+    }
+}
+
 /**
  * 直接下载功能 - 在录播播放页面注入下载按钮和复制链接功能
- * 通过拦截 XHR 请求获取视频下载地址，支持 m3u8 格式转换
+ * MP4 仍使用 GM_download；HLS 录播按网页播放链路拉取、解密并流式合并为 MPEG-TS。
  * 仅在 onlineroomse.pku.edu.cn/player 页面生效
  */
 async function initializeDirectDownload() {
@@ -263,70 +679,83 @@ async function initializeDirectDownload() {
     let subTitle = '';
     let lecturerName = '';
     let fileName = '';
+    let isHls = false;
 
-    let JWT = '';
-
+    const JWT_STORAGE_KEY = 'PKU_ART_DIRECT_DOWNLOAD_JWT';
     const RELOAD_ATTEMPTS_KEY = 'PKU_ART_DIRECT_DOWNLOAD_RELOAD_ATTEMPTS';
     const MAX_RELOAD_ATTEMPTS = 3;
 
     const originalSend = XMLHttpRequest.prototype.send;
     const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    const requestHeaders = new WeakMap();
 
     XMLHttpRequest.prototype.setRequestHeader = function (header, value) {
-        if (!this._headers) {
-            this._headers = {};
+        let headers = requestHeaders.get(this);
+        if (!headers) {
+            headers = new Map();
+            requestHeaders.set(this, headers);
         }
-        this._headers[header] = value;
-        originalSetRequestHeader.apply(this, arguments);
+        headers.set(String(header).toLowerCase(), String(value));
+        return originalSetRequestHeader.apply(this, arguments);
     };
 
     XMLHttpRequest.prototype.send = function () {
         this.addEventListener('load', function () {
             if (this.responseURL.includes('get-sub-info-by-auth-data')) {
-                downloadJson = JSON.parse(this.response);
+                const authorization = requestHeaders.get(this)?.get('authorization') || '';
+                const jwt = authorization.replace(/^Bearer\s+/i, '').trim();
+                if (jwt) {
+                    try {
+                        sessionStorage.setItem(JWT_STORAGE_KEY, jwt);
+                        console.log('[PKU Art] JWT 已保存到 sessionStorage');
+                    } catch (error) {
+                        console.warn('[PKU Art] 无法保存 JWT', error);
+                    }
+                } else {
+                    console.warn('[PKU Art] 视频信息请求中未找到 Authorization 请求头');
+                }
+
+                try {
+                    downloadJson = JSON.parse(this.response);
+                } catch (error) {
+                    console.error('[PKU Art] 录播信息解析失败', error);
+                    return;
+                }
+
+                if (!downloadJson?.list?.[0]?.sub_content) {
+                    console.warn('[PKU Art] 录播信息中缺少可下载资源', downloadJson);
+                    downloadJson = '';
+                    return;
+                }
+
                 try {
                     sessionStorage.removeItem(RELOAD_ATTEMPTS_KEY);
                 } catch (error) {
                     console.warn('[PKU Art] 无法清除重载计数', error);
                 }
 
-                if (this._headers) {
-                    for (const headerName in this._headers) {
-                        if (headerName.toLowerCase() === 'authorization') {
-                            JWT = this._headers[headerName].split(' ')[1];
-                            break;
-                        }
-                    }
-                }
-
-                if (JWT) {
-                    console.log('[PKU Art] 成功捕获到 JWT:\n', JWT);
-                    sessionStorage.setItem('PKU_ART_DIRECT_DOWNLOAD_JWT', JWT);
-                    console.log('[PKU Art] JWT 已保存到 sessionStorage');
-                } else {
-                    console.log('[PKU Art] 未在此请求中找到 JWT。');
-                }
-
                 console.log('[PKU Art] XHR 响应结果：\n', downloadJson);
                 courseName = downloadJson.list[0].title;
                 subTitle = downloadJson.list[0].sub_title;
                 lecturerName = downloadJson.list[0].lecturer_name;
-                fileName = `${courseName} - ${subTitle} - ${lecturerName}.mp4`;
-                const filmContent = JSON.parse(downloadJson.list[0].sub_content);
-                const isM3u8 = filmContent.save_playback.is_m3u8;
-                let resolvedDownloadUrl = '';
-                if (isM3u8 == 'yes') {
-                    const m3u8 = filmContent.save_playback.contents;
-                    const m3u8Pattern =
-                        /https:\/\/resourcese\.pku\.edu\.cn\/play\/0\/harpocrates\/\d+\/\d+\/\d+\/([a-zA-Z0-9]+)(\/.+)\/playlist\.m3u8.*/;
-                    const hash = m3u8.match(m3u8Pattern)[1];
-                    resolvedDownloadUrl = `https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/downloadVideo.action?resourceId=${hash}`;
-                    console.log('[PKU Art] m3u8 下载链接转换成功：\n', resolvedDownloadUrl);
-                } else {
-                    resolvedDownloadUrl = filmContent.save_playback.contents;
+                try {
+                    const filmContent = JSON.parse(downloadJson.list[0].sub_content);
+                    const playback = filmContent.save_playback;
+                    const contents = playback?.contents;
+                    const firstSource = Array.isArray(contents) ? contents[0]?.preview || contents[0] : contents;
+                    downloadUrl = typeof firstSource === 'string' ? firstSource : '';
+                    if (!downloadUrl) {
+                        throw new Error('录播资源地址为空');
+                    }
+                    isHls = playback?.is_m3u8 === 'yes' || /\.m3u8(?:$|\?)/i.test(downloadUrl);
+                    fileName = sanitizeFileName(
+                        `${courseName} - ${subTitle} - ${lecturerName}.${isHls ? 'ts' : 'mp4'}`,
+                    );
+                    console.log('[PKU Art] 下载链接解析成功：\n', downloadUrl);
+                } catch (error) {
+                    console.error('[PKU Art] 录播资源地址解析失败', error);
+                    downloadJson = '';
                 }
-                downloadUrl = resolvedDownloadUrl;
-                console.log('[PKU Art] 下载链接解析成功：\n', downloadUrl);
             }
         });
         originalSend.apply(this, arguments);
@@ -370,6 +799,8 @@ async function initializeDirectDownload() {
             }
         }, 500);
     });
+    XMLHttpRequest.prototype.send = originalSend;
+    XMLHttpRequest.prototype.setRequestHeader = originalSetRequestHeader;
     if (!didCaptureDownloadInfo || !downloadJson) {
         return;
     }
@@ -399,36 +830,48 @@ async function initializeDirectDownload() {
     };
 
     const downloadButton = createFooterButton('injectDownloadButton', '下载视频', downloadIcon);
-    const copyDownloadUrlButton = createFooterButton('injectCopyDownloadUrlButton', '复制链接地址', linkIcon);
+    const copyDownloadUrlButton = isHls
+        ? null
+        : createFooterButton('injectCopyDownloadUrlButton', '复制链接地址', linkIcon);
 
-    const downloadSwitchArea = document.createElement('div');
-    downloadSwitchArea.id = 'injectDownloadSwitchArea';
-    downloadSwitchArea.className = 'PKU-Art';
-    downloadSwitchArea.innerHTML = `
+    let downloadSwitchArea = null;
+    let switchInput = null;
+    if (isHls) {
+        downloadAreaFooter.classList.add('hls-download');
+    } else {
+        downloadSwitchArea = document.createElement('div');
+        downloadSwitchArea.id = 'injectDownloadSwitchArea';
+        downloadSwitchArea.className = 'PKU-Art';
+        downloadSwitchArea.innerHTML = `
 <input type="checkbox" id="injectDownloadSwitch" class="PKU-Art" checked>
 <label for="injectDownloadSwitch"></label>
-<span id="injectDownloadSwitchDesc" class="PKU-Art"> 重命名文件</span>
+<span id="injectDownloadSwitchDesc" class="PKU-Art">自动重命名</span>
 `;
 
-    // 点击整个区域切换 checkbox 状态
-    downloadSwitchArea.addEventListener('click', (e) => {
-        // 如果点击的是 checkbox 或关联的 label，浏览器会自动处理切换
-        const isCheckboxOrLabel = e.target.id === 'injectDownloadSwitch' || e.target.htmlFor === 'injectDownloadSwitch';
-        if (!isCheckboxOrLabel) {
-            const checkbox = downloadSwitchArea.querySelector('#injectDownloadSwitch');
-            checkbox.checked = !checkbox.checked;
-        }
-    });
+        // 点击整个区域切换 checkbox 状态
+        downloadSwitchArea.addEventListener('click', (event) => {
+            // 如果点击的是 checkbox 或关联的 label，浏览器会自动处理切换
+            const isCheckboxOrLabel =
+                event.target.id === 'injectDownloadSwitch' || event.target.htmlFor === 'injectDownloadSwitch';
+            if (!isCheckboxOrLabel) {
+                switchInput.checked = !switchInput.checked;
+            }
+        });
+        switchInput = downloadSwitchArea.querySelector('#injectDownloadSwitch');
+    }
 
     downloadAreaFooter.appendChild(downloadButton);
-    downloadAreaFooter.appendChild(copyDownloadUrlButton);
-    downloadAreaFooter.appendChild(downloadSwitchArea);
+    if (copyDownloadUrlButton) {
+        downloadAreaFooter.appendChild(copyDownloadUrlButton);
+    }
+    if (downloadSwitchArea) {
+        downloadAreaFooter.appendChild(downloadSwitchArea);
+    }
 
-    const switchInput = downloadSwitchArea.querySelector('#injectDownloadSwitch');
     const isSafari = navigator.userAgent.includes('Safari') && !navigator.userAgent.includes('Chrome');
-    const renameSupported = typeof GM_download === 'function';
+    const renameSupported = isHls || typeof GM_download === 'function';
     if (!renameSupported) {
-        // 删除原有的 switchArea，创建新的提示元素追加到末尾，并切换为 3 列布局
+        // 删除不可用的重命名开关，改为显示环境兼容性提示。
         downloadSwitchArea.remove();
         downloadAreaFooter.classList.add('rename-unsupported');
         const renameUnsupportedTip = document.createElement('div');
@@ -442,28 +885,100 @@ async function initializeDirectDownload() {
 
     const copySupported =
         typeof GM_setClipboard === 'function' || (navigator.clipboard && navigator.clipboard.writeText);
-    if (!copySupported) {
+    if (copyDownloadUrlButton && !copySupported) {
         copyDownloadUrlButton.disabled = true;
-        copyDownloadUrlButton.querySelector('span').textContent = '复制链接不可用';
+        copyDownloadUrlButton.querySelector('span:last-child').textContent = '复制链接不可用';
     }
 
     // 下载状态管理
     let currentDownload = null;
     let isDownloading = false;
 
-    const startDownload = (renameEnabled) => {
+    const escapeHtml = (value) =>
+        String(value)
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#039;');
+
+    const formatRemainingTime = (seconds) => {
+        if (!Number.isFinite(seconds)) return '';
+        if (seconds < 60) return `预计还需 ${Math.max(1, seconds)} 秒`;
+        if (seconds < 3600) return `预计还需 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        return `预计还需 ${hours} 小时${minutes ? ` ${minutes} 分` : ''}`;
+    };
+
+    const getDownloadInfoMarkup = (renameEnabled) => {
+        const fileLabel = renameEnabled ? '文件' : '建议文件名';
+        const sourceLabel = isHls ? 'HLS 源地址' : '文件源地址';
+        return `
+<div class="PKU-Art inject-download-info">
+    <div class="PKU-Art inject-download-info-row">
+        <span class="PKU-Art inject-download-info-label">${fileLabel}</span>
+        <span class="PKU-Art inject-download-file-name" title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</span>
+    </div>
+    <div class="PKU-Art inject-download-info-row">
+        <span class="PKU-Art inject-download-info-label">来源</span>
+        <a class="PKU-Art" target="_blank" rel="noopener noreferrer" href="${escapeHtml(downloadUrl)}">${sourceLabel}</a>
+    </div>
+</div>`;
+    };
+
+    const renderDownloadStatus = ({
+        title,
+        detail = '',
+        state = 'active',
+        progress = null,
+        renameEnabled = true,
+    }) => {
+        const downloadTip = document.getElementById('injectDownloadTip');
         const downloadTipText = document.getElementById('injectDownloadTipText');
+        if (!downloadTip || !downloadTipText) return;
+
+        downloadTip.dataset.state = state;
+        const progressMarkup = progress
+            ? `
+<div class="PKU-Art inject-download-progress" role="progressbar" aria-label="下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.percent.toFixed(2)}">
+    <span class="PKU-Art" style="width: ${Math.min(100, Math.max(0, progress.percent))}%"></span>
+</div>
+<div class="PKU-Art inject-download-metrics">${progress.items
+                  .filter(Boolean)
+                  .map((item) => `<span class="PKU-Art">${escapeHtml(item)}</span>`)
+                  .join('')}</div>`
+            : '';
+        const noticeMarkup = isHls
+            ? '<div class="PKU-Art inject-download-notice">自 2026 年 09 月开始，教学网对视频进行了加密，下载速度和稳定性可能有所下降，且只能下载 .ts 格式（需要使用 IINA 或 VLC 等播放器播放）。</div>'
+            : '';
+        downloadTipText.innerHTML = `
+<div class="PKU-Art inject-download-status-title">${escapeHtml(title)}</div>
+${detail ? `<div class="PKU-Art inject-download-status-detail">${escapeHtml(detail)}</div>` : ''}
+${progressMarkup}
+${getDownloadInfoMarkup(renameEnabled)}
+${noticeMarkup}`;
+    };
+
+    const formatDownloadError = (error) => {
+        const message = String(error?.message || error || '未知错误');
+        return message.replace(/^获取 HLS 资源失败：[^\n]+\n?/, '获取视频资源失败：');
+    };
+
+    const shouldUseManagedDownload = () => isHls || Boolean(renameSupported && switchInput?.checked);
+
+    const startDownload = async (renameEnabled) => {
         const cancelBtn = document.getElementById('injectCancelDownload');
         const restartBtn = document.getElementById('injectRestartDownload');
 
-        let downloadInfo = `下载文件名：${fileName}<br/>下载地址：<a target="_blank" href="${downloadUrl}">文件源地址</a>`;
-        if (!renameEnabled) {
-            downloadInfo = `正常文件名：${fileName}<br/>下载地址：<a target="_blank" href="${downloadUrl}">文件源地址</a>`;
-        }
-
         if (!renameEnabled) {
             window.open(downloadUrl, '_blank');
-            downloadTipText.innerHTML = `已在新窗口启动下载<br/>${downloadInfo}`;
+            renderDownloadStatus({
+                title: '已在新窗口打开源文件',
+                detail: '浏览器将接管后续下载。',
+                state: 'success',
+                renameEnabled,
+            });
             cancelBtn.disabled = true;
             restartBtn.disabled = false;
             isDownloading = false;
@@ -473,7 +988,97 @@ async function initializeDirectDownload() {
         isDownloading = true;
         cancelBtn.disabled = false;
         restartBtn.disabled = true;
-        downloadTipText.innerHTML = `已在后台启动下载，请勿刷新页面<br/>${downloadInfo}`;
+        renderDownloadStatus({
+            title: '正在准备下载…',
+            detail: isHls ? '将保存为 TS 文件；下载过程中请保持本页面打开。' : '下载过程中请保持本页面打开。',
+            renameEnabled,
+        });
+
+        if (isHls) {
+            const abortController = new AbortController();
+            currentDownload = { abort: () => abortController.abort() };
+            window.addEventListener(
+                'beforeunload',
+                () => {
+                    if (currentDownload) {
+                        currentDownload.abort();
+                    }
+                },
+                { once: true },
+            );
+
+            try {
+                const result = await downloadHlsVideo({
+                    playlistUrl: downloadUrl,
+                    fileName,
+                    signal: abortController.signal,
+                    onProgress(progress) {
+                        if (!progress.totalSegments) {
+                            renderDownloadStatus({
+                                title: progress.stage,
+                                detail: '将保存为 TS 文件；下载过程中请保持本页面打开。',
+                                state: progress.status || 'active',
+                                renameEnabled,
+                            });
+                            return;
+                        }
+
+                        const percent = (progress.completedSegments / progress.totalSegments) * 100;
+                        const downloadedMiB = (progress.downloadedBytes / 1024 / 1024).toFixed(1);
+                        const speedMiB = (progress.bytesPerSecond / 1024 / 1024).toFixed(1);
+                        renderDownloadStatus({
+                            title: progress.stage,
+                            detail: '下载过程中请保持本页面打开。网络波动时会自动切换节点重试。',
+                            state: progress.status || 'active',
+                            progress: {
+                                percent,
+                                items: [
+                                    `${percent.toFixed(1)}%`,
+                                    `${progress.completedSegments}/${progress.totalSegments} 个分片`,
+                                    `已写入 ${downloadedMiB} MiB`,
+                                    progress.bytesPerSecond > 0 ? `${speedMiB} MiB/s` : '正在计算速度',
+                                    formatRemainingTime(progress.remainingSeconds),
+                                ],
+                            },
+                            renameEnabled,
+                        });
+                    },
+                });
+
+                renderDownloadStatus({
+                    title: result.outputType === 'browser-download' ? '视频处理完成' : '下载完成',
+                    detail:
+                        result.outputType === 'browser-download'
+                            ? '浏览器正在保存 TS 文件，请留意下载列表。'
+                            : 'TS 文件已保存到所选位置。',
+                    state: 'success',
+                    renameEnabled,
+                });
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    renderDownloadStatus({
+                        title: '下载已取消',
+                        detail: '本次下载产生的临时文件已清理。',
+                        state: 'neutral',
+                        renameEnabled,
+                    });
+                } else {
+                    console.error('[PKU Art] HLS 下载失败', error);
+                    renderDownloadStatus({
+                        title: '下载失败',
+                        detail: formatDownloadError(error),
+                        state: 'error',
+                        renameEnabled,
+                    });
+                }
+            } finally {
+                currentDownload = null;
+                isDownloading = false;
+                cancelBtn.disabled = true;
+                restartBtn.disabled = false;
+            }
+            return;
+        }
 
         try {
             let lastPrintTime = 0;
@@ -488,9 +1093,15 @@ async function initializeDirectDownload() {
                 onerror(event) {
                     console.error('[PKU Art] 下载失败：', event);
                     isDownloading = false;
+                    currentDownload = null;
                     cancelBtn.disabled = true;
                     restartBtn.disabled = false;
-                    downloadTipText.innerHTML = `下载失败：${event.error}<br/>${downloadInfo}`;
+                    renderDownloadStatus({
+                        title: '下载失败',
+                        detail: event.error || '浏览器未能完成下载。',
+                        state: 'error',
+                        renameEnabled,
+                    });
                 },
                 onprogress(event) {
                     const currentTime = Date.now();
@@ -509,16 +1120,30 @@ async function initializeDirectDownload() {
                             estimatedTimeRemainingSeconds = 'inf';
                         }
 
-                        downloadTipText.innerHTML = `已在后台启动下载，请勿刷新页面。<br/>下载进度：${currentProgress}%，预计剩余时间：${estimatedTimeRemainingSeconds}秒<br/>${downloadInfo}`;
+                        renderDownloadStatus({
+                            title: '正在下载视频…',
+                            detail: '下载过程中请保持本页面打开。',
+                            progress: {
+                                percent: percentComplete,
+                                items: [
+                                    `${currentProgress}%`,
+                                    estimatedTimeRemainingSeconds === 'inf'
+                                        ? '正在估算剩余时间'
+                                        : formatRemainingTime(estimatedTimeRemainingSeconds),
+                                ],
+                            },
+                            renameEnabled,
+                        });
                         lastPrintTime = currentTime;
                         lastBytesLoaded = event.loaded;
                     }
                 },
                 onload() {
                     isDownloading = false;
+                    currentDownload = null;
                     cancelBtn.disabled = true;
                     restartBtn.disabled = false;
-                    downloadTipText.innerHTML = `下载完成<br/>${downloadInfo}`;
+                    renderDownloadStatus({ title: '下载完成', state: 'success', renameEnabled });
                 },
             });
 
@@ -535,16 +1160,22 @@ async function initializeDirectDownload() {
             console.warn('[PKU Art] GM_download 调用失败，回退到新窗口下载', error);
             window.open(downloadUrl, '_blank');
             isDownloading = false;
+            currentDownload = null;
             cancelBtn.disabled = true;
             restartBtn.disabled = false;
-            downloadTipText.innerHTML = `已在新窗口启动下载<br/>正常文件名：${fileName}<br/>下载地址：<a target="_blank" href="${downloadUrl}">文件源地址</a>`;
+            renderDownloadStatus({
+                title: '已在新窗口打开源文件',
+                detail: '当前环境不支持自动重命名，浏览器将接管后续下载。',
+                state: 'neutral',
+                renameEnabled: false,
+            });
             alert('看上去当前环境不支持自动重命名功能，已尝试使用新标签页下载');
         }
     };
 
     downloadButton.addEventListener('click', async () => {
         console.log(`[PKU Art] 已启动下载：\n文件名：${fileName}\n源地址：${downloadUrl}`);
-        const renameEnabled = renameSupported && switchInput && switchInput.checked;
+        const renameEnabled = shouldUseManagedDownload();
 
         const existingTip = document.getElementById('injectDownloadTip');
         if (existingTip) {
@@ -585,16 +1216,25 @@ async function initializeDirectDownload() {
         cancelBtn.addEventListener('click', () => {
             if (currentDownload && isDownloading) {
                 currentDownload.abort();
+                if (isHls) {
+                    cancelBtn.disabled = true;
+                    renderDownloadStatus({
+                        title: '正在取消下载…',
+                        detail: '正在停止网络请求并清理临时文件。',
+                        state: 'neutral',
+                    });
+                    return;
+                }
                 currentDownload = null;
                 isDownloading = false;
                 cancelBtn.disabled = true;
                 restartBtn.disabled = false;
-                downloadTipText.innerHTML = `下载已取消<br/>下载文件名：${fileName}<br/>下载地址：<a target="_blank" href="${downloadUrl}">文件源地址</a>`;
+                renderDownloadStatus({ title: '下载已取消', state: 'neutral', renameEnabled });
             }
         });
 
         restartBtn.addEventListener('click', () => {
-            const renameEnabled = renameSupported && switchInput && switchInput.checked;
+            const renameEnabled = shouldUseManagedDownload();
             startDownload(renameEnabled);
         });
 
@@ -607,7 +1247,7 @@ async function initializeDirectDownload() {
         startDownload(renameEnabled);
     });
 
-    copyDownloadUrlButton.addEventListener('click', async () => {
+    copyDownloadUrlButton?.addEventListener('click', async () => {
         if (copyDownloadUrlButton.disabled) {
             return;
         }
