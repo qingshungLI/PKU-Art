@@ -90,8 +90,9 @@ python3 video-text/service.py --workers 1
 python3 video-text/service.py --model medium --workers 1
 ```
 
-默认使用 2 个 CPU 进程、int8 和 10 分钟分块。`--batch-size 8` 虽然可能更快，
-但实测会改变部分文字，因此默认关闭。
+默认使用 2 个 CPU 进程、int8 和 10 分钟分块。模型在服务进程存活期间只加载一次，
+后续课程会复用同一组识别进程；关闭服务后释放内存。内存不足时使用 `--workers 1`。
+`--batch-size 8` 虽然可能更快，但实测会改变部分文字，因此默认关闭。
 
 ## 限制
 
@@ -125,6 +126,7 @@ python3 video-text/service.py --model medium --workers 1
 npm install
 npm run build:check
 python3 -m py_compile video-text/service.py
+python3 -m unittest discover -s video-text -p 'test_*.py'
 ```
 
 维护者发布本仓库的可安装用户脚本：
@@ -133,4 +135,5 @@ python3 -m py_compile video-text/service.py
 npm run build:fork
 ```
 
-生成结果为 `release/PKU-Art.user.js`。普通使用者不需要执行此步骤。
+版本号统一读取 `package.json` 的 `version` 字段，生成结果为 `release/PKU-Art.user.js`。
+每次发布功能更新前先递增版本号。普通使用者不需要执行此步骤。

@@ -1,11 +1,11 @@
 {
     "name": "pku-art",
     "private": true,
-    "version": "0.0.0",
+    "version": "2.6.26.2",
     "type": "module",
     "scripts": {
-        "build:local": "PKU_ART_LOCAL=1 vite build",
-        "build:fork": "PKU_ART_FORK=1 PKU_ART_VERSION=2.6.26.1 vite build && cp dist/pku-art.user.js release/PKU-Art.user.js",
+        "build:local": "vite build --mode local-build",
+        "build:fork": "vite build --mode fork",
         "build:check": "vite build",
         "dev": "vite",
         "build": "uv run update-cdn.py build",

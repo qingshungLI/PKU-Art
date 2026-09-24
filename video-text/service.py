@@ -22,6 +22,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
+def file_uri(path):
+    return Path(path).resolve().as_uri()
+
+
 def extract_audio(task, target, workdir, seconds=None, start=0, progress=None):
     source = task['url']
     expected_duration = None
@@ -47,7 +51,9 @@ def extract_audio(task, target, workdir, seconds=None, start=0, progress=None):
             keyfile = workdir / f'key-{index}'
             keyfile.write_bytes(data)
             keyfile.chmod(0o600)
-            key.uri = str(keyfile)
+            # FFmpeg treats `C:\...` as a custom `c:` protocol on Windows.
+            # A file URI works on Windows, macOS and Linux.
+            key.uri = file_uri(keyfile)
         for segment in playlist.segments:
             segment.uri = segment.absolute_uri
             if segment.init_section:
@@ -154,10 +160,20 @@ def split_audio(audio, directory, chunk_seconds, silence_window=5):
     return chunks
 
 
-def run(task, output, model='small', seconds=None, start=0, progress=None, workers=2, chunk_seconds=600, batch_size=1):
+def create_transcription_pool(model='small', workers=2, batch_size=1):
+    worker_count = max(1, min(int(workers or 2), 4))
+    threads = max(1, min(4, (os.cpu_count() or 4) // worker_count))
+    return ProcessPoolExecutor(max_workers=worker_count,
+                               mp_context=multiprocessing.get_context('spawn'),
+                               initializer=initialize_engine,
+                               initargs=(model, threads, batch_size))
+
+
+def run(task, output, model='small', seconds=None, start=0, progress=None, workers=2, chunk_seconds=600,
+        batch_size=1, process_pool=None):
     report = progress or (lambda stage, percent: None)
     title = re.sub(r'[\x00-\x1f\\/:*?"<>|]', '_', task.get('title') or '课程').strip(' .')[:100] or '课程'
-    folder = Path(output) / title
+    folder = Path(output)
     folder.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='pku-audio-') as directory:
         audio = Path(directory) / 'audio.wav'
@@ -173,20 +189,32 @@ def run(task, output, model='small', seconds=None, start=0, progress=None, worke
         if not chunks:
             raise RuntimeError('没有生成音频分块')
         report(f'正在并行转写（{len(chunks)} 个分块）', 48)
-        worker_count = max(1, min(int(workers or 2), len(chunks), 4))
         jobs = [(path, offset + start) for path, offset in chunks]
         all_segments = []
-        threads = max(1, min(4, (os.cpu_count() or 4) // worker_count))
-        with ProcessPoolExecutor(max_workers=worker_count,
-                                 mp_context=multiprocessing.get_context('spawn'),
-                                 initializer=initialize_engine,
-                                 initargs=(model, threads, batch_size)) as pool:
+        owns_pool = process_pool is None
+        pool = process_pool or create_transcription_pool(model, workers, batch_size)
+        futures = {}
+        try:
             futures = {pool.submit(transcribe_chunk, job): job[0] for job in jobs}
             for done, future in enumerate(as_completed(futures), 1):
                 all_segments.extend(future.result())
                 Path(futures[future]).unlink()
                 report(f'正在并行转写 · {done}/{len(futures)} 个分块',
                        min(99, 48 + done / len(futures) * 51))
+        except Exception:
+            for future in futures:
+                future.cancel()
+            # TemporaryDirectory must remain alive until already-running workers
+            # stop reading their chunks.
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if owns_pool:
+                pool.shutdown(wait=True, cancel_futures=True)
         all_segments.sort(key=lambda item: item[0])
         if not all_segments:
             raise RuntimeError('音轨中未识别到文字')
@@ -218,7 +246,6 @@ def allowed_resource(url):
 
 
 def validate_task(task):
-    import m3u8
     if not isinstance(task, dict) or not isinstance(task.get('title'), str):
         raise ValueError('无效的课程任务')
     if not task['title'].strip() or len(task['title']) > 300:
@@ -233,6 +260,7 @@ def validate_task(task):
     if urlparse(clean['url']).path.endswith('.m3u8') and not playlist_text:
         raise ValueError('播放鉴权数据缺失，请在播放页重新提取')
     if playlist_text:
+        import m3u8
         if not isinstance(playlist_text, str) or not playlist_text.startswith('#EXTM3U'):
             raise ValueError('播放清单无效')
         playlist = m3u8.loads(playlist_text, uri=clean['url'])
@@ -279,13 +307,33 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def remove_legacy_duplicate(folder):
+    """Remove only the exact redundant directory written by versions <= 2.6.26.1."""
+    final = folder / '全文.txt'
+    if not final.is_file():
+        return
+    for child in folder.iterdir():
+        if not child.is_dir():
+            continue
+        contents = list(child.iterdir())
+        if (len(contents) == 1 and contents[0].name == '全文.txt' and contents[0].is_file()
+                and contents[0].read_bytes() == final.read_bytes()):
+            contents[0].unlink()
+            child.rmdir()
+
+
 class JobStore:
-    def __init__(self, root, runner=run, **options):
+    def __init__(self, root, runner=run, process_pool=None, **options):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         self.runner = runner
         self.options = options
+        self.process_pool = process_pool
+        if self.process_pool is None and runner is run:
+            self.process_pool = create_transcription_pool(options.get('model', 'small'),
+                                                          options.get('workers', 2),
+                                                          options.get('batch_size', 1))
         self.lock = threading.RLock()
         self.jobs = {}
         self.worker = ThreadPoolExecutor(max_workers=1)
@@ -315,6 +363,7 @@ class JobStore:
                 task_path = path.parent / 'task.json'
                 if state['status'] == 'complete' and (path.parent / '全文.txt').is_file():
                     task_path.unlink(missing_ok=True)
+                    remove_legacy_duplicate(path.parent)
                 elif state['status'] in ('queued', 'running') and task_path.exists():
                     task = validate_task(json.loads(task_path.read_text(encoding='utf-8')))
                     state.update(status='queued', progress=0, stage='服务重启，等待重新处理')
@@ -374,10 +423,15 @@ class JobStore:
                     self.persist(self.jobs[identifier])
                     last_saved = time.monotonic()
         try:
-            path = self.runner(task, folder, progress=report, **self.options)
-            temporary = folder / '全文.txt.partial'
-            shutil.copyfile(path, temporary)
-            temporary.replace(folder / '全文.txt')
+            runner_options = dict(self.options)
+            if self.process_pool is not None:
+                runner_options['process_pool'] = self.process_pool
+            path = Path(self.runner(task, folder, progress=report, **runner_options))
+            final = folder / '全文.txt'
+            if path.resolve() != final.resolve():
+                temporary = folder / '全文.txt.partial'
+                shutil.copyfile(path, temporary)
+                temporary.replace(final)
             with self.lock:
                 (folder / 'task.json').unlink(missing_ok=True)
                 self.jobs[identifier].update(status='complete', stage='转写完成', progress=100)
@@ -419,6 +473,8 @@ class JobStore:
             self.closed = True
         # Unstarted jobs stay on disk. Finish the active lecture before exiting.
         self.worker.shutdown(wait=True, cancel_futures=True)
+        if self.process_pool is not None:
+            self.process_pool.shutdown(wait=True, cancel_futures=True)
 
 
 class Handler(BaseHTTPRequestHandler):

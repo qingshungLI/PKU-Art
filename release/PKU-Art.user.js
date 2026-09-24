@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Art
 // @namespace    arthals/pku-art
-// @version      2.6.26.1
+// @version      2.6.26.2
 // @author       Arthals
 // @description  给你一个足够好看的北大网站。
 // @license      GPL-3.0 license
@@ -21,7 +21,6 @@
 // @inject-into  page
 // @run-at       document-start
 // @author-blog  https://arthals.ink
-// @date         2026/09/24
 // ==/UserScript==
 
 (function () {
