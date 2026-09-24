@@ -1,7 +1,7 @@
 {
     "name": "pku-art",
     "private": true,
-    "version": "2.6.26.2",
+    "version": "2.6.27.1",
     "type": "module",
     "scripts": {
         "build:local": "vite build --mode local-build",

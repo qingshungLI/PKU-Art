@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Art
 // @namespace    arthals/pku-art
-// @version      2.6.26.2
+// @version      2.6.27.1
 // @author       Arthals
 // @description  给你一个足够好看的北大网站。
 // @license      GPL-3.0 license
