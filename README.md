@@ -164,7 +164,7 @@ Safari 需安装浏览器插件 [UserScripts](https://apps.apple.com/cn/app/user
 1. 克隆本项目：
 
     ```bash
-    git clone https://github.com/zhuozhiyongde/PKU-Art.git
+    git clone https://github.com/qingshungLI/PKU-Art.git
     ```
 
 2. 进入工作目录，安装依赖：
