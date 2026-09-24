@@ -62,6 +62,13 @@ ffmpeg -i input.ts -c copy output.mp4
 
 </details>
 
+### `3` 课堂回放转写
+
+将本人可播放的课堂录像转成带时间戳的完整 TXT，支持单节提取、按课程批量排队、
+断点恢复和 ZIP 下载。音频只在本机临时处理，完成后自动删除；文字输出只进行繁体转简体，
+不会生成摘要。首次使用前需要启动本地识别服务，参见
+[课堂回放转写安装说明](video-text/README.md)。
+
 ## 📦 安装
 
 > [!WARNING]
@@ -134,6 +141,13 @@ Safari 需安装浏览器插件 [UserScripts](https://apps.apple.com/cn/app/user
 
 -   [CDN for JavaScript](https://cdn.arthals.ink/release/PKU-Art.user.js)：源代码更新后立即更新
 -   [GreasyFork](https://greasyfork.org/zh-CN/scripts/436323-pku-art)：每天同步上述源一次
+
+### 安装带课堂转写功能的版本
+
+本仓库的转写版本不会使用上面的官方 CDN。请先安装 Tampermonkey，然后点击
+[安装 PKU-Art 转写版](https://raw.githubusercontent.com/qingshungLI/PKU-Art/main/release/PKU-Art.user.js)。
+浏览器脚本安装后，再按照[本地转写服务说明](video-text/README.md)安装 Python 依赖并启动服务。
+普通使用者不需要安装 Node.js、Bun，也不需要自行构建源码。
 
 ## 🚨 使用须知
 
