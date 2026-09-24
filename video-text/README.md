@@ -3,6 +3,10 @@
 把本人可播放的教学网课堂录像转成带时间戳的完整 TXT。识别在本机完成，
 不生成总结；输出前只执行繁体转简体。
 
+> [!TIP]
+> 初次安装建议先阅读仓库首页的[转写版快速部署](../README.md#-转写版快速部署)。
+> 本文用于补充运行参数、存储位置、更新和故障排查。
+
 ## 普通用户安装
 
 需要 **Python 3.10 或更高版本**和 **FFmpeg**。先在终端验证：
@@ -49,6 +53,23 @@ video-text\.venv\Scripts\python.exe video-text\service.py
 安装和启动必须使用同一个 Python。服务启动时会主动检查 Python 依赖、FFmpeg 和 ffprobe；
 缺失时会显示对应的安装提示。
 
+## 更新
+
+使用 Git 克隆的用户可以执行：
+
+```bash
+git pull
+video-text/.venv/bin/python -m pip install -r video-text/requirements.txt
+```
+
+Windows 将第二条命令替换为：
+
+```powershell
+video-text\.venv\Scripts\python.exe -m pip install -r video-text\requirements.txt
+```
+
+浏览器脚本会通过 Tampermonkey 检查更新；如果没有自动更新，也可以重新点击仓库首页的安装链接。
+
 ## 使用
 
 - 单节：打开能正常播放的课堂实录，点击“提取完整课程文字”，完成后下载 TXT。
@@ -77,6 +98,26 @@ python3 video-text/service.py --model medium --workers 1
 仅支持已结束录像、直接音视频地址和 AES-128 HLS。识别可能错写术语、公式或英文，
 重要内容请核对原录像。服务不接收 Cookie/JWT；未完成队列会临时保存单个录像的播放清单和密钥，
 任务结束后删除。强制结束进程可能在系统临时目录留下 `pku-audio-*`。
+
+## 常见问题
+
+### 页面提示“本地转写服务未连接”
+
+确认 `service.py` 所在终端仍在运行，并且显示的地址是 `http://127.0.0.1:8878`。
+服务不能关闭后继续在后台识别。
+
+### 提示缺少 Python 依赖
+
+通常是安装依赖和启动服务用了不同的 Python。请直接使用本文给出的 `.venv/bin/python`
+或 `.venv\\Scripts\\python.exe`，不要混用系统 Python、Conda 和虚拟环境。
+
+### 提示缺少 FFmpeg 或 ffprobe
+
+重新安装 FFmpeg，并确认 `ffmpeg -version` 和 `ffprobe -version` 在新终端中都能运行。
+
+### 第一次任务长时间没有开始识别
+
+首次运行需要下载 Whisper 模型，取决于网络速度可能需要几分钟。模型下载完成后不会每节课重复下载。
 
 开发构建检查：
 
